@@ -1,0 +1,177 @@
+---
+description: Widget/unit test conventions — bloc_test for blocs, pumpWidget with BlocProvider overrides, golden tests where applicable, test behavior not implementation
+globs: ["**/*_test.dart"]
+alwaysApply: false
+---
+
+## What This Rule Does
+
+Applies to `_test.dart` files. Keeps tests asserting observable behavior
+(rendered output, navigation, the state sequence a bloc emits) rather than
+internal implementation details that break on harmless refactors.
+
+> **Divergence from the upstream platform.** `flutter-platform` ships this
+> rule in a Riverpod form (`ProviderScope` overrides, `ProviderContainer`).
+> This app uses BLoC — see the note in `02-flutter-state-guard.mdc`.
+
+## Bloc Tests: `bloc_test` and the Emitted State Sequence
+
+A bloc's contract is *the sequence of states it emits in response to an
+event*. Assert exactly that, with `bloc_test`:
+
+```dart
+void main() {
+  late MockMenuRepository repository;
+
+  setUp(() {
+    repository = MockMenuRepository();
+  });
+
+  group('MenuBloc', () {
+    blocTest<MenuBloc, MenuState>(
+      'emits [inProgress, success] when the menu loads',
+      setUp: () {
+        when(() => repository.fetchMenu()).thenAnswer((_) async => [latte]);
+      },
+      build: () => MenuBloc(repository: repository),
+      act: (bloc) => bloc.add(const MenuRequested()),
+      expect: () => [
+        const MenuLoadInProgress(),
+        MenuLoadSuccess(drinks: [latte]),
+      ],
+    );
+
+    blocTest<MenuBloc, MenuState>(
+      'emits [inProgress, failure] when the repository throws',
+      setUp: () {
+        when(() => repository.fetchMenu())
+            .thenThrow(const NetworkException('offline'));
+      },
+      build: () => MenuBloc(repository: repository),
+      act: (bloc) => bloc.add(const MenuRequested()),
+      expect: () => [
+        const MenuLoadInProgress(),
+        const MenuLoadFailure('offline'),
+      ],
+    );
+  });
+}
+```
+
+- **The failure path is not optional.** Every bloc test group covers at least
+  one success and one failure sequence; a bloc tested only on the happy path
+  is untested where it matters.
+- `expect:` compares states by value — this is why every state extends
+  `Equatable` (`02-flutter-state-guard.mdc`). If an `expect:` fails with two
+  states that look identical, a missing field in `props` is the usual cause,
+  not a bloc bug.
+- Use `seed:` to start a bloc from a specific state rather than dispatching a
+  chain of setup events.
+- Use `wait:`/`skip:` sparingly and never to paper over a nondeterministic
+  emit order — fix the bloc instead.
+- Assert on emitted **states**, never on a bloc's private fields or on how
+  many times a private helper ran.
+
+## Widget Tests: `pumpWidget` + a Provided Bloc
+
+Every widget test for a bloc-consuming widget provides that bloc explicitly —
+never lets a real repository-backed bloc run in a widget test.
+
+For most screens, provide a real bloc with a faked repository, which exercises
+the actual state transitions:
+
+```dart
+testWidgets('shows the drinks returned by the repository', (tester) async {
+  final repository = FakeMenuRepository();
+
+  await tester.pumpWidget(
+    RepositoryProvider<MenuRepository>.value(
+      value: repository,
+      child: MaterialApp(
+        home: BlocProvider(
+          create: (_) => MenuBloc(repository: repository)
+            ..add(const MenuRequested()),
+          child: const MenuScreen(),
+        ),
+      ),
+    ),
+  );
+
+  await tester.pumpAndSettle();
+
+  expect(find.text('Latte'), findsOneWidget);
+});
+```
+
+When a test needs to pin the widget to one exact state (an error view, an
+empty view), use `MockBloc` from `bloc_test` with a stubbed state instead —
+it is the tool for asserting *rendering*, decoupled from transitions:
+
+```dart
+class MockMenuBloc extends MockBloc<MenuEvent, MenuState>
+    implements MenuBloc {}
+
+testWidgets('shows a retry button on failure', (tester) async {
+  final bloc = MockMenuBloc();
+  when(() => bloc.state).thenReturn(const MenuLoadFailure('offline'));
+
+  await tester.pumpWidget(
+    MaterialApp(
+      home: BlocProvider<MenuBloc>.value(value: bloc, child: const MenuScreen()),
+    ),
+  );
+
+  expect(find.text('Try again'), findsOneWidget);
+});
+```
+
+- Register fallback values for any event type passed to `verify`/`when` with
+  `registerFallbackValue` in `setUpAll` — `mocktail` requires it for
+  non-primitive types.
+- `pumpAndSettle()` after actions that trigger animations or async state
+  changes; plain `pump()` when asserting an intermediate (e.g. in-progress)
+  state before it resolves.
+- A screen with all four states (initial/in-progress, success, empty success,
+  failure) gets a test per state — that's the coverage bar for a generated
+  screen, not just the populated case.
+
+## Golden Tests
+
+Where the repo already has golden tests set up (a `goldens/` directory and
+`matchesGoldenFile` usage present), add a golden test for new visually
+significant widgets that have no existing coverage — a card, a custom button
+variant, an empty/error state illustration. Do not introduce golden testing to
+a repo that doesn't already have it without asking; it's a noticeably
+different CI/tooling commitment (font loading, platform-specific rendering)
+that the team should opt into deliberately.
+
+## Test Behavior, Not Implementation
+
+- Assert what the user sees or what the app does (`find.text(...)`,
+  `find.byIcon(...)`, navigation to a new route, a repository method called
+  with the right arguments) — not a bloc's private field or an internal
+  method's call count beyond what proves the behavior.
+- Verifying a dispatched event is legitimate when the event *is* the
+  behavior under test (a button dispatching `CartItemRemoved`):
+  `verify(() => bloc.add(const CartItemRemoved('id-1'))).called(1);`
+
+## Mocking
+
+Use `mocktail` (already a dev dependency — confirm before reaching for
+anything else, per `10-evidence-and-dependency-guard.mdc`) for repository
+fakes, and `bloc_test`'s `MockBloc`/`MockCubit` for blocs. Prefer a small
+hand-written fake over a mock when the interface is small and the test
+benefits from readable, explicit behavior — the `Fake*Repository`
+implementations in `lib/features/*/data/` are usable directly in tests.
+
+## Integration Tests
+
+End-to-end flows (sign-in, checkout) that need a real device/simulator use
+the `integration_test` package, kept separate from `test/` (typically
+`integration_test/`) so they don't run as part of the fast unit/widget suite
+by default.
+
+## Relationship to Other Rules
+
+`02-flutter-state-guard.mdc` governs how state is structured and emitted;
+this rule governs how that state is faked and asserted on in tests.

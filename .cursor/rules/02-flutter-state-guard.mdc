@@ -1,0 +1,211 @@
+---
+description: Enforce BLoC state-management conventions — event-driven Bloc over Cubit, sealed events and sealed state variants, correct BlocProvider scoping, no misuse of setState
+globs: ["**/*.dart"]
+alwaysApply: false
+---
+
+## What This Rule Does
+
+`flutter_bloc` is the state-management approach for this app. This rule keeps
+state management consistent: the right unit of state, sealed event and state
+hierarchies, blocs scoped correctly, and `setState` reserved for what it's
+actually for.
+
+> **Divergence from the upstream platform.** `flutter-platform` ships this
+> rule in a Riverpod form. This app deliberately uses BLoC, so this rule,
+> `04-flutter-test-guard.mdc`, and the `flutter-bloc-gen` / `flutter-screen-gen`
+> / `flutter-test-gen` skills were rewritten. Do not "restore" Riverpod
+> guidance from the upstream copy — see `memory-bank/architecture.md`.
+
+## Bloc, Not Cubit
+
+This codebase uses **event-driven `Bloc` everywhere**, not `Cubit`. Every
+state transition is triggered by an event, so the sequence of user intent is
+traceable and replayable in tests and in `onTransition` logging.
+
+```dart
+// ❌ Cubit — no event record of why state changed
+class MenuCubit extends Cubit<MenuState> {
+  Future<void> load() async { ... }
+}
+
+// ✓ Bloc — the intent is a first-class, testable value
+class MenuBloc extends Bloc<MenuEvent, MenuState> {
+  MenuBloc({required MenuRepository repository})
+      : _repository = repository,
+        super(const MenuInitial()) {
+    on<MenuRequested>(_onRequested);
+    on<MenuCategorySelected>(_onCategorySelected);
+  }
+
+  final MenuRepository _repository;
+  ...
+}
+```
+
+Do not introduce a `Cubit` alongside these blocs — a single pattern is the
+point. If a feature's state genuinely has no meaningful events, it probably
+isn't bloc-worthy state at all (see `setState` Boundaries below).
+
+## Sealed Events, Sealed State Variants
+
+Events and states are both **sealed class hierarchies** extending
+`Equatable`. Sealed types give exhaustive `switch` checking in the UI; the
+`Equatable` base makes `bloc_test`'s `expect: [...]` comparisons work by
+value.
+
+```dart
+sealed class MenuEvent extends Equatable {
+  const MenuEvent();
+  @override
+  List<Object?> get props => const [];
+}
+
+final class MenuRequested extends MenuEvent {
+  const MenuRequested();
+}
+
+final class MenuCategorySelected extends MenuEvent {
+  const MenuCategorySelected(this.categoryId);
+  final String categoryId;
+
+  @override
+  List<Object?> get props => [categoryId];
+}
+```
+
+```dart
+sealed class MenuState extends Equatable {
+  const MenuState();
+  @override
+  List<Object?> get props => const [];
+}
+
+final class MenuInitial extends MenuState {
+  const MenuInitial();
+}
+
+final class MenuLoadInProgress extends MenuState {
+  const MenuLoadInProgress();
+}
+
+final class MenuLoadSuccess extends MenuState {
+  const MenuLoadSuccess({required this.drinks, this.selectedCategoryId});
+  final List<Drink> drinks;
+  final String? selectedCategoryId;
+
+  @override
+  List<Object?> get props => [drinks, selectedCategoryId];
+}
+
+final class MenuLoadFailure extends MenuState {
+  const MenuLoadFailure(this.message);
+  final String message;
+
+  @override
+  List<Object?> get props => [message];
+}
+```
+
+Rules for these hierarchies:
+
+- Every event and state class is `final` (or `sealed` if further extended)
+  and immutable — `const` constructors wherever the fields allow.
+- **Every state variant must be handled in the UI.** A `switch` over a sealed
+  state with no `default` gives a compile error when a variant is added; keep
+  it that way rather than adding a catch-all `default` branch.
+- A failure state carries a **display-ready message**, not a raw exception.
+  Mapping `AppException` → message happens in the bloc, so the widget never
+  formats an error.
+- Never expose a mutable collection in a state without `List.unmodifiable`
+  or treating it as read-only; `Equatable`'s `props` compares by value, and a
+  mutated list silently breaks change detection.
+
+## Emit Discipline
+
+- Emit a new state object; never mutate the current one. `MenuLoadSuccess`
+  with a changed field is a new instance (`copyWith` on the entity, new state).
+- `emit` is only valid inside an `on<Event>` handler. Do not capture `emit`
+  and call it later from a callback or a `Future.then` — use `await` inside
+  the handler, or `emit.forEach`/`emit.onEach` for a stream source.
+- Never call `emit` after the bloc is closed. If a handler awaits something
+  long-running, guard with `if (isClosed) return;` before emitting.
+- Wrap every repository call in `try`/`catch` on the app's typed
+  `AppException` and emit an explicit failure state — an uncaught throw in a
+  handler surfaces as an unhandled `BlocUnhandledErrorException`, not as UI.
+
+```dart
+Future<void> _onRequested(MenuRequested event, Emitter<MenuState> emit) async {
+  emit(const MenuLoadInProgress());
+  try {
+    final drinks = await _repository.fetchMenu();
+    if (isClosed) return;
+    emit(MenuLoadSuccess(drinks: drinks));
+  } on AppException catch (e) {
+    emit(MenuLoadFailure(e.message));
+  }
+}
+```
+
+- Use `transformer: droppable()`/`restartable()` from `bloc_concurrency` only
+  if that package is added deliberately; without it, handlers for the same
+  event type run concurrently. For a refresh-style event, guard re-entry with
+  a state check instead of assuming serial execution.
+
+## BlocProvider Scoping
+
+- A bloc used by exactly one feature is provided at **that feature's route**
+  (`BlocProvider(create: ...)` in the route's `builder`), not app-globally —
+  this is what makes its state reset when the user leaves the flow.
+- A bloc genuinely shared app-wide (`AuthBloc`) is provided once above
+  `MaterialApp.router` in `MultiBlocProvider`. Most blocs are not app-wide;
+  confirm against `memory-bank/architecture.md` before adding one there.
+- Repositories are injected via `RepositoryProvider` at the app root and read
+  with `context.read<XRepository>()` in a route's `create:` callback. A bloc
+  takes its repository as a **constructor dependency on the abstract
+  interface** — never constructs `FakeMenuRepository()` itself, which is what
+  keeps it testable.
+- Avoid module-level mutable singletons and global bloc instances. If you're
+  tempted to reach for a global, a `RepositoryProvider`/`BlocProvider` covers
+  it.
+- `BlocProvider.value` is for re-exposing an **existing** bloc to a new
+  subtree (e.g. a pushed modal). It does not own the bloc and will not close
+  it — never use it to "share" a bloc you actually created elsewhere for
+  convenience.
+
+## Reading State
+
+- `BlocBuilder`/`context.watch<XBloc>()` inside `build()` for reactive reads.
+- `context.read<XBloc>()` inside event handlers (`onPressed`, `onSubmitted`)
+  to dispatch. Calling `watch` in a callback rebuilds nothing and is a sign
+  the wrong method was used; calling `read` in `build()` freezes the UI at
+  the first state.
+- `BlocSelector` or `buildWhen` when a widget only cares about one field of a
+  large state — a whole-screen `BlocBuilder` that rebuilds on every unrelated
+  field change is the most common avoidable rebuild in a bloc codebase.
+- **`BlocListener` for side effects**, never `BlocBuilder`. Navigation,
+  snackbars, and dialogs go in `listener:`; `builder:` must be a pure
+  function of state. Navigating from inside `builder:` fires on every rebuild.
+- `BlocConsumer` when a widget genuinely needs both, rather than nesting a
+  listener inside a builder.
+
+## `setState` Boundaries
+
+`setState` is acceptable only for state that is:
+
+- Local to a single widget (never read by a sibling or ancestor)
+- Ephemeral (does not need to survive the widget being rebuilt from a bloc
+  state change, does not need to be tested independently of the widget)
+
+Fine: a `TextField`'s obscure-password toggle, an `ExpansionTile`'s
+open/closed flag, a local `AnimationController` listener triggering a repaint.
+
+Not fine: form validation state, anything persisted, list data from a
+repository, anything another widget reacts to — these go through a bloc.
+
+## Relationship to Other Rules
+
+`01-flutter-architecture-guard.mdc` governs *where* blocs live and forbids
+business rules inside them (pure rules belong in `domain/usecases/`); this
+rule governs *which* bloc shape to use and *how* its state is emitted and
+read. `04-flutter-test-guard.mdc` covers how these blocs are tested.

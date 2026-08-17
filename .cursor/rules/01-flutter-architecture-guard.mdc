@@ -1,0 +1,112 @@
+---
+description: Enforce layered/feature-first architecture boundaries in Flutter apps — no business logic in widgets, correct provider placement
+globs: ["**/*.dart"]
+alwaysApply: false
+---
+
+## What This Rule Does
+
+Applies whenever `.dart` files are in context. Keeps the widget tree as a
+rendering layer only, keeps business/domain logic out of widgets, and keeps
+providers placed at the layer they belong to instead of being declared
+wherever is convenient.
+
+## Layering
+
+Two conventions are common in Flutter apps this platform generates for —
+detect which one the repo already uses (`memory-bank/architecture.md`) and
+follow it; do not introduce a second convention alongside the first:
+
+**Layered (presentation / domain / data):**
+```
+lib/
+  presentation/   screens, widgets, providers that only read state
+  domain/         entities, use-cases, repository interfaces
+  data/           repository implementations, API clients, DTOs
+```
+
+**Feature-first — what this app uses:**
+```
+lib/
+  app/               composition root, router, theme, shell chrome
+  core/              cross-cutting primitives (AppException, Money, storage)
+  features/
+    <feature>/
+      presentation/   screens/, widgets/
+      application/    <feature>_bloc.dart, _event.dart, _state.dart
+      domain/         entities/, repositories/ (interfaces), usecases/
+      data/           repositories/ (implementations)
+  shared/            cross-feature widgets, utilities
+```
+
+Whichever is in use, the dependency direction is one-way: presentation
+depends on application/domain, application/domain depends on data through
+an interface, never the reverse. A repository implementation must not import
+a widget; a widget must not construct a repository directly — it goes
+through a provider.
+
+## No Business Logic in Widgets
+
+A widget's `build()` method should describe layout and delegate everything
+else. Concretely, a widget must not:
+
+- Call a repository or API client directly
+- Contain a `switch`/branching block that encodes a business rule (e.g. tax
+  calculation, eligibility check, retry logic)
+- Perform data transformation beyond simple formatting (date/number display)
+
+That logic belongs in a `Bloc` (state + orchestration) or a domain use-case
+(pure business rule), which the widget then reads via `BlocBuilder` /
+`context.watch` and triggers via `context.read<XBloc>().add(...)`.
+
+```dart
+// ❌ Business logic in a widget
+class CartTotalText extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<CartBloc>().state as CartLoadSuccess;
+    final total = state.items.fold(0.0, (sum, i) => sum + i.price * (1 - i.discount));
+    return Text('\$${total.toStringAsFixed(2)}');
+  }
+}
+
+// ✓ Widget renders a value the domain already computed
+class CartTotalText extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return BlocSelector<CartBloc, CartState, CartTotals>(
+      selector: (state) =>
+          state is CartLoadSuccess ? state.totals : CartTotals.empty,
+      builder: (context, totals) => Text(totals.total.formatted),
+    );
+  }
+}
+```
+
+The calculation itself lives in `domain/usecases/` (`CalculateCartTotals`), is
+called by the bloc, and is carried on the state — so the widget, the receipt,
+and the tests can never disagree about the number.
+
+## Bloc Placement
+
+- A bloc used by exactly one feature lives with that feature
+  (`features/<feature>/application/`) and is provided at **that feature's
+  route**, not in a global folder or above `MaterialApp`.
+- A bloc genuinely shared across features (`AuthBloc`, `CartBloc`) is provided
+  once in `CoffeeApp` — confirm against `memory-bank/architecture.md` before
+  adding a third; most blocs are not actually app-wide.
+- Blocs take an **abstract repository interface** as a constructor dependency
+  (`AuthRepository`), with the concrete implementation
+  (`FakeAuthRepository`, `ApiAuthRepository`) bound in a single
+  `RepositoryProvider` at the composition root — this keeps the data layer
+  swappable for tests.
+- A bloc may depend on another feature's **domain interface** (`ProductBloc`
+  reads `MenuRepository`). It must not import another feature's widgets,
+  blocs, or data-layer implementations.
+
+## Relationship to Other Rules
+
+`02-flutter-state-guard.mdc` governs *how* state is managed once it's
+correctly placed by this rule — which bloc shape to use, how states are emitted
+and read. This rule governs *where* it lives and what may not touch it
+directly.
