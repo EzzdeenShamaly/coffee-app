@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local tooling and working notes — kept on disk, not published.
+.claude/
+.artifacts/
+memory-bank/
+CLAUDE.md
